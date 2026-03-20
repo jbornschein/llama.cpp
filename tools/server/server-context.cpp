@@ -237,6 +237,12 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
+    // prompt logprobs (filled when echo=true and n_probs>0)
+    std::vector<completion_token_output> prompt_token_probs;
+    int32_t i_batch_prompt_chunk_start = -1;  // absolute batch pos of first token in current prompt chunk
+    int32_t i_batch_prompt_chunk_end   = -1;  // absolute batch pos of last token in current prompt chunk
+    int32_t prompt_chunk_start_token   =  0;  // prompt token index of first token in current chunk
+
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
@@ -340,6 +346,10 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        prompt_token_probs.clear();
+        i_batch_prompt_chunk_start = -1;
+        i_batch_prompt_chunk_end   = -1;
+        prompt_chunk_start_token   =  0;
         json_schema = json();
 
         task_prev = std::move(task);
@@ -1897,11 +1907,11 @@ private:
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
-            // set probability for sampled token
+            // set probability and rank for sampled token (cur is sorted highest-first)
             for (size_t i = 0; i < max_probs; i++) {
-                // set probability for sampled token
                 if (cur[i].id == result.tok) {
                     result.prob = cur[i].p;
+                    result.rank = (int)(i + 1);
                     break;
                 }
             }
@@ -1911,11 +1921,65 @@ private:
             for (size_t i = 0; i < n_probs; i++) {
                 result.probs.push_back({
                     cur[i].id,
-                    common_token_to_piece(ctx_tgt, cur[i].id, special),
-                    cur[i].p
+                   common_token_to_piece(ctx_tgt, cur[i].id, special),
+                    cur[i].p,
+                    (int)(i + 1)
                 });
             }
         }
+    }
+
+    // Like populate_token_probs but for prompt tokens:
+    // actual_tok is the token whose log-prob we want (the token that WAS at this position).
+    // idx is the local batch index of the logit that predicts actual_tok.
+    // Always uses pre-sampling logits. Always includes actual_tok even if outside top-k.
+    completion_token_output populate_prompt_token_probs(
+            llama_token actual_tok, size_t n_probs_request, bool special, int idx) const {
+        completion_token_output result;
+        result.tok          = actual_tok;
+        result.text_to_send = common_token_to_piece(ctx_tgt, actual_tok, special);
+        result.prob         = 0.0f;
+        result.rank         = 0;
+
+        std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, std::numeric_limits<size_t>::max());
+        const size_t max_probs = cur.size();
+        const size_t n_probs   = std::min(max_probs, n_probs_request);
+
+        // find actual token rank and prob (cur sorted highest-first)
+        for (size_t i = 0; i < max_probs; i++) {
+            if (cur[i].id == actual_tok) {
+                result.prob = cur[i].p;
+                result.rank = (int)(i + 1);
+                break;
+            }
+        }
+
+        // top-k candidates
+        bool actual_in_topk = false;
+        result.probs.reserve(n_probs + 1);
+        for (size_t i = 0; i < n_probs; i++) {
+            if (cur[i].id == actual_tok) {
+                actual_in_topk = true;
+            }
+            result.probs.push_back({
+                cur[i].id,
+                common_token_to_piece(ctx_tgt, cur[i].id, special),
+                cur[i].p,
+                (int)(i + 1)
+            });
+        }
+
+        // always include actual token even if not in top-k
+        if (!actual_in_topk && result.rank > 0) {
+            result.probs.push_back({
+                actual_tok,
+                result.text_to_send,
+                result.prob,
+                result.rank
+            });
+        }
+
+        return result;
     }
 
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
@@ -2042,6 +2106,27 @@ private:
                         slot.generated_token_probs.begin(),
                         slot.generated_token_probs.end());
             }
+        }
+
+        // populate prompt logprobs when echo is enabled
+        res->echo = slot.task->params.echo;
+        if (slot.task->params.echo && slot.task->params.sampling.n_probs > 0) {
+            const int n_prompt = slot.task->n_tokens();
+            // ensure the vector is large enough
+            slot.prompt_token_probs.resize(n_prompt);
+
+            // fill in the first token's decoded text (log-prob is null for position 0)
+            if (n_prompt > 0) {
+                const llama_token first_tok = slot.task->tokens[0];
+                if (first_tok != LLAMA_TOKEN_NULL) {
+                    slot.prompt_token_probs[0].tok          = first_tok;
+                    slot.prompt_token_probs[0].text_to_send = common_token_to_piece(
+                        ctx_tgt, first_tok, params_base.special);
+                    slot.prompt_token_probs[0].rank         = 0;  // signals null log-prob
+                }
+            }
+
+            res->prompt_probs_output = std::move(slot.prompt_token_probs);
         }
 
         res->generation_params = slot.task->params; // copy the parameters
@@ -3401,6 +3486,12 @@ private:
                         has_mtmd = true;
                     }
 
+                    // Record chunk start for prompt logprobs (image processing above doesn't touch batch)
+                    if (slot.task->params.echo && slot.task->params.sampling.n_probs > 0) {
+                        slot.i_batch_prompt_chunk_start = batch.size();
+                        slot.prompt_chunk_start_token   = slot.prompt.n_tokens();
+                    }
+
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
 
@@ -3467,6 +3558,14 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
+                    // Enable logits for prompt logprob extraction (echo mode)
+                    if (slot.task->params.echo && slot.task->params.sampling.n_probs > 0 && n_tokens_cur > 0) {
+                        slot.i_batch_prompt_chunk_end = batch.size() - 1;
+                        for (int32_t j = (int32_t)n_tokens_prev; j < (int32_t)batch.size(); j++) {
+                            batch.set_output(j, true);
+                        }
+                    }
+
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
@@ -3478,8 +3577,11 @@ private:
 
                         GGML_ASSERT(batch.size() > 0);
 
-                        // extract the logits only for the last token
-                        batch.set_output(batch.size() - 1, true);
+                        // extract the logits for the last token (for generation);
+                        // in echo mode all logits are already enabled above
+                        if (!(slot.task->params.echo && slot.task->params.sampling.n_probs > 0)) {
+                            batch.set_output(batch.size() - 1, true);
+                        }
 
                         slot.stats.n_gen = 0;
                         slot.i_batch     = batch.size() - 1;
@@ -3637,6 +3739,66 @@ private:
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
+        }
+
+        // Extract prompt token logprobs for slots with echo enabled.
+        // Each logit at batch position j predicts the token at prompt position
+        //   chunk_start_token + (j - chunk_start_batch) + 1
+        // so logits[j] → log-prob of the *next* prompt token after position j.
+        for (auto & slot : slots) {
+            if (!slot.task || !slot.task->params.echo ||
+                    slot.task->params.sampling.n_probs == 0) {
+                continue;
+            }
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT &&
+                    slot.state != SLOT_STATE_DONE_PROMPT) {
+                continue;
+            }
+            if (slot.i_batch_prompt_chunk_start < 0 ||
+                    slot.i_batch_prompt_chunk_end < 0) {
+                continue;
+            }
+
+            const int abs_start = slot.i_batch_prompt_chunk_start;
+            const int abs_end   = slot.i_batch_prompt_chunk_end;
+            // clamp to the current sub-batch window
+            const int clamp_start = std::max(abs_start, (int)off);
+            const int clamp_end   = std::min(abs_end,   (int)(off + batch_view.n_tokens) - 1);
+            if (clamp_start > clamp_end) {
+                continue;
+            }
+
+            const auto & input_tokens = slot.task->tokens;
+            const int n_prompt        = slot.task->n_tokens();
+
+            for (int abs_j = clamp_start; abs_j <= clamp_end; abs_j++) {
+                const int local_j      = abs_j - (int)off;
+                const int pos_in_chunk = abs_j - abs_start;
+                const int predicted_idx = slot.prompt_chunk_start_token + pos_in_chunk + 1;
+
+                if (predicted_idx >= n_prompt) {
+                    continue;
+                }
+
+                const llama_token actual_tok = input_tokens[predicted_idx];
+                if (actual_tok == LLAMA_TOKEN_NULL) {
+                    continue;
+                }
+
+                completion_token_output cto = populate_prompt_token_probs(
+                    actual_tok,
+                    (size_t)slot.task->params.sampling.n_probs,
+                    params_base.special,
+                    local_j);
+
+                if ((int)slot.prompt_token_probs.size() <= predicted_idx) {
+                    slot.prompt_token_probs.resize(predicted_idx + 1);
+                }
+                slot.prompt_token_probs[predicted_idx] = std::move(cto);
+            }
+
+            slot.i_batch_prompt_chunk_start = -1;
+            slot.i_batch_prompt_chunk_end   = -1;
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -4189,6 +4351,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+
+            task.params.echo = task.params.chat_parser_params.echo;
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 

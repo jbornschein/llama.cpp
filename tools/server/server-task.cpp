@@ -371,27 +371,118 @@ json server_task_result_cmpl_final::usage_json_oaicompat() {
     };
 }
 
+// Build OAI-compatible completion logprobs object (text_offset/token_logprobs/tokens/top_logprobs)
+// and prompt_logprobs (vLLM-style, keyed by token id string).
+// prompt_probs covers prompt tokens; gen_probs covers generated tokens.
+// Returns {logprobs_obj, prompt_logprobs_arr}.
+static std::pair<json, json> build_oai_completion_logprobs(
+        const std::vector<completion_token_output> & prompt_probs,
+        const std::vector<completion_token_output> & gen_probs) {
+    if (prompt_probs.empty() && gen_probs.empty()) {
+        return {json(nullptr), json(nullptr)};
+    }
+
+    json tokens_arr        = json::array();
+    json token_logprobs_arr = json::array();
+    json text_offset_arr   = json::array();
+    json top_logprobs_arr  = json::array();
+    json prompt_logprobs_arr = json::array();
+
+    int offset = 0;
+
+    // Helper: add one token entry to the logprobs arrays.
+    // rank==0 means "null" log-prob entry (first token or missing data).
+    auto add_entry = [&](const completion_token_output & cto, bool is_null_lp) {
+        std::string tok_str = cto.text_to_send;
+        tok_str.resize(validate_utf8(tok_str));
+
+        tokens_arr.push_back(tok_str);
+        text_offset_arr.push_back(offset);
+        offset += (int)tok_str.size();
+
+        if (is_null_lp) {
+            token_logprobs_arr.push_back(json(nullptr));
+            top_logprobs_arr.push_back(json(nullptr));
+        } else {
+            token_logprobs_arr.push_back(completion_token_output::logarithm(cto.prob));
+
+            json top_lp = json::object();
+            for (const auto & p : cto.probs) {
+                std::string p_str = p.txt;
+                p_str.resize(validate_utf8(p_str));
+                top_lp[p_str] = completion_token_output::logarithm(p.prob);
+            }
+            top_logprobs_arr.push_back(top_lp);
+        }
+    };
+
+    // Prompt tokens
+    for (size_t i = 0; i < prompt_probs.size(); i++) {
+        const auto & cto = prompt_probs[i];
+        bool is_null = (cto.rank == 0);
+        add_entry(cto, is_null);
+
+        // Build prompt_logprobs entry (vLLM-style, keyed by token id string)
+        if (is_null) {
+            prompt_logprobs_arr.push_back(json(nullptr));
+        } else {
+            json pl_entry = json::object();
+            for (const auto & p : cto.probs) {
+                pl_entry[std::to_string(p.tok)] = json{
+                    {"logprob",       completion_token_output::logarithm(p.prob)},
+                    {"rank",          p.rank},
+                    {"decoded_token", [&]{ std::string s = p.txt; s.resize(validate_utf8(s)); return s; }()},
+                };
+            }
+            prompt_logprobs_arr.push_back(pl_entry);
+        }
+    }
+
+    // Generated tokens
+    for (const auto & cto : gen_probs) {
+        add_entry(cto, false);
+    }
+
+    json logprobs_obj = json{
+        {"tokens",        tokens_arr},
+        {"token_logprobs", token_logprobs_arr},
+        {"text_offset",   text_offset_arr},
+        {"top_logprobs",  top_logprobs_arr},
+    };
+
+    json pl = prompt_probs.empty() ? json(nullptr) : prompt_logprobs_arr;
+    return {logprobs_obj, pl};
+}
+
 json server_task_result_cmpl_final::to_json_oaicompat() {
     std::time_t t = std::time(0);
-    json logprobs = json(nullptr); // OAI default to null
-    if (!stream && probs_output.size() > 0) {
-        logprobs = json{
-            {"content", completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs)},
-        };
+
+    // Build logprobs in OAI completion format
+    json logprobs_obj     = json(nullptr);
+    json prompt_logprobs  = json(nullptr);
+    if (!stream && (probs_output.size() > 0 || prompt_probs_output.size() > 0)) {
+        auto [lp, pl] = build_oai_completion_logprobs(prompt_probs_output, probs_output);
+        logprobs_obj    = lp;
+        prompt_logprobs = pl;
     }
+
+    std::string text = echo ? (prompt + content) : content;
+
     json finish_reason = "length";
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = "stop";
     }
+    json choice = json{
+        {"text",          text},
+        {"index",         index},
+        {"logprobs",      logprobs_obj},
+        {"finish_reason", finish_reason},
+    };
+    if (echo) {
+        choice["prompt_logprobs"] = prompt_logprobs;
+    }
     json res = json {
-        {"choices",            json::array({
-            json{
-                {"text",          content},
-                {"index",         index},
-                {"logprobs",      logprobs},
-                {"finish_reason", finish_reason},
-            }
-        })},
+        {"choices",            json::array({choice})},
         {"created",            t},
         {"model",              oaicompat_model},
         {"system_fingerprint", std::string(llama_build_info())},

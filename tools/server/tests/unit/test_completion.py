@@ -661,3 +661,134 @@ def test_completion_prompt_cache():
         assert "prompt_n" in timings and timings["prompt_n"] + timings["cache_n"] == n_prompt
         assert "predicted_n" in timings and timings["predicted_n"] == n_predict
         assert "tokens" in res.body and isinstance(res.body["tokens"], list)
+
+
+# Tests for OAI /v1/completions echo + logprobs feature
+
+def test_oaicompat_completion_echo_logprobs():
+    """echo=true with logprobs returns prompt tokens with log-probs in OAI format."""
+    global server
+    server.start()
+    prompt = "I believe the meaning"
+    res = server.make_request("POST", "/v1/completions", data={
+        "model":      "tinyllama-2",
+        "prompt":     prompt,
+        "max_tokens": 3,
+        "logprobs":   2,
+        "echo":       True,
+        "seed":       42,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200
+    choice = res.body["choices"][0]
+
+    # echoed prompt + generated text
+    assert choice["text"].startswith(prompt)
+
+    lp = choice["logprobs"]
+    assert lp is not None
+
+    n_prompt_toks = res.body["usage"]["prompt_tokens"]
+    n_gen_toks    = res.body["usage"]["completion_tokens"]
+    n_total       = n_prompt_toks + n_gen_toks
+
+    # arrays must cover prompt + generated tokens
+    assert len(lp["tokens"])         == n_total
+    assert len(lp["token_logprobs"]) == n_total
+    assert len(lp["text_offset"])    == n_total
+    assert len(lp["top_logprobs"])   == n_total
+
+    # first token: null log-prob
+    assert lp["token_logprobs"][0] is None
+    assert lp["top_logprobs"][0]   is None
+
+    # remaining tokens: valid negative log-probs
+    for i in range(1, n_total):
+        assert isinstance(lp["token_logprobs"][i], float)
+        assert lp["token_logprobs"][i] <= 0.0
+        assert isinstance(lp["top_logprobs"][i], dict)
+        assert len(lp["top_logprobs"][i]) >= 1
+        for tok_str, logp in lp["top_logprobs"][i].items():
+            assert isinstance(tok_str, str)
+            assert isinstance(logp, float) and logp <= 0.0
+
+    # text_offset must be non-decreasing and start at 0
+    assert lp["text_offset"][0] == 0
+    for i in range(1, n_total):
+        assert lp["text_offset"][i] >= lp["text_offset"][i - 1]
+
+    # prompt_logprobs: one entry per prompt token
+    pl = choice["prompt_logprobs"]
+    assert pl is not None
+    assert len(pl) == n_prompt_toks
+    assert pl[0] is None  # first prompt token has no log-prob
+
+    for i in range(1, n_prompt_toks):
+        assert isinstance(pl[i], dict)
+        assert len(pl[i]) >= 1
+        for tok_id_str, info in pl[i].items():
+            assert tok_id_str.isdigit()
+            assert isinstance(info["logprob"], float) and info["logprob"] <= 0.0
+            assert isinstance(info["rank"], int) and info["rank"] >= 1
+            assert isinstance(info["decoded_token"], str)
+
+
+def test_oaicompat_completion_echo_logprobs_actual_token_always_present():
+    """The actual prompt token must appear in prompt_logprobs even if outside top-k."""
+    global server
+    server.start()
+    # Use logprobs=1 so top-k is 1; the actual token may well be rank > 1
+    res = server.make_request("POST", "/v1/completions", data={
+        "model":      "tinyllama-2",
+        "prompt":     "I believe the meaning of life is",
+        "max_tokens": 1,
+        "logprobs":   1,
+        "echo":       True,
+        "seed":       42,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200
+    choice = res.body["choices"][0]
+    pl = choice["prompt_logprobs"]
+    n_prompt_toks = res.body["usage"]["prompt_tokens"]
+    assert len(pl) == n_prompt_toks
+
+    # For every non-null entry, the actual prompt token must be present
+    # We verify this indirectly: each entry must have at least one token whose
+    # decoded_token matches the corresponding token in logprobs["tokens"]
+    tokens = choice["logprobs"]["tokens"]
+    for i in range(1, n_prompt_toks):
+        entry = pl[i]
+        assert entry is not None
+        decoded = [v["decoded_token"] for v in entry.values()]
+        assert tokens[i] in decoded, (
+            f"actual token '{tokens[i]}' not found in prompt_logprobs[{i}]: {decoded}"
+        )
+
+
+def test_oaicompat_completion_no_echo_no_prompt_logprobs():
+    """Without echo=true there is no prompt_logprobs field and text is generation only."""
+    global server
+    server.start()
+    prompt = "I believe the meaning"
+    res = server.make_request("POST", "/v1/completions", data={
+        "model":      "tinyllama-2",
+        "prompt":     prompt,
+        "max_tokens": 3,
+        "logprobs":   1,
+        "seed":       42,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200
+    choice = res.body["choices"][0]
+
+    # text must NOT start with the prompt (generation only)
+    assert not choice["text"].startswith(prompt)
+
+    # prompt_logprobs must be absent
+    assert "prompt_logprobs" not in choice
+
+    # logprobs covers generated tokens only
+    n_gen = res.body["usage"]["completion_tokens"]
+    lp = choice["logprobs"]
+    assert len(lp["tokens"]) == n_gen

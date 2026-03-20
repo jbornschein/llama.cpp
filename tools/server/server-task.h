@@ -74,6 +74,7 @@ struct task_params {
 
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
+    bool echo                = false;
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
@@ -299,11 +300,13 @@ using server_task_result_ptr = std::unique_ptr<server_task_result>;
 struct completion_token_output {
     llama_token tok;
     float prob;
+    int rank = 0;  // 1-indexed rank; 0 means no logprob (e.g. first prompt token)
     std::string text_to_send;
     struct prob_info {
         llama_token tok;
         std::string txt;
         float prob;
+        int rank = 0;  // 1-indexed rank by probability (1 = most likely)
     };
     std::vector<prob_info> probs;
 
@@ -337,6 +340,8 @@ struct server_task_result_cmpl_final : server_task_result {
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
+    bool echo = false;
+    std::vector<completion_token_output> prompt_probs_output;  // logprobs for prompt tokens when echo=true
     std::vector<std::string>  response_fields;
 
     task_params generation_params;

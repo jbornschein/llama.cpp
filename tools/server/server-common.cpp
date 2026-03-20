@@ -1027,7 +1027,16 @@ json oaicompat_completion_params_parse(const json & body) {
 
     // Handle "echo" field
     if (json_value(body, "echo", false)) {
-        throw std::runtime_error("Only no echo is supported");
+        llama_params["echo"] = true;
+    }
+
+    // Handle "logprobs" field (OAI completions API: integer 0-5)
+    if (body.contains("logprobs") && !body.at("logprobs").is_null()) {
+        const auto & lp = body.at("logprobs");
+        int logprobs_n = lp.is_number() ? lp.get<int>() : (lp.get<bool>() ? 1 : 0);
+        if (logprobs_n > 0) {
+            llama_params["n_probs"] = logprobs_n;
+        }
     }
 
     // Params supported by OAI but unsupported by llama.cpp
